@@ -1,0 +1,501 @@
+name: "🏗️Build Kernels (LineageOS lineage-21 / OnePlus 7 Pro)"
+
+# ============================================================================
+# 改造说明（基于 ebears/OnePlus-SM8150-Kernel-Builds 的 matrix.build.yml）
+#   原版目标：OnePlus SM8150 + YAAP Android 16 + yaap/kernel_oneplus_sm8150@sixteen
+#   本版目标：OnePlus SM8150 + LineageOS 21 (Android 14) + LineageOS/android_kernel_oneplus_sm8150@lineage-21
+#             （内核 4.14.355-openela，与设备现用的 4.14.357-openela-miru 几乎同源）
+#   改动点：
+#     1. defconfig      gulch_defconfig          -> lineage_sm8150_defconfig
+#     2. 内核源         yaap@sixteen             -> LineageOS@lineage-21
+#     3. KernelSU hooks YAAP 自带的 kernelsu.patch -> ebears 的 000_syscall_hooks.patch
+#     4. 只保留 KernelSU-Next / SukiSU-Ultra 两个变体（Rissu 已注释，减少首次构建变量）
+#     5. 产物命名       YAAP-16 -> LOS-21
+#   已知风险：SUSFS 的内核补丁(100~104)是针对 YAAP 4.14.336 树生成的，
+#             用在 lineage-21 的 4.14.355 上可能有 hunk 冲突 —— 失败时工作流会自动上传 .rej 文件。
+#   刷机：产物是 AnyKernel3 zip，只替换 boot 里的内核，不动 vendor/ramdisk。
+# ============================================================================
+on:
+  workflow_dispatch:
+#   schedule:
+#     # http://crontab.guru
+#     # Runs at 7:00 PM UTC, on the 1st and 15th of every month
+#     - cron: "0 19 1,15 * *"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    continue-on-error: true # Ensure the release job runs even part of the build job fails
+    strategy:
+      fail-fast: false # Ensure in-progress and queued jobs in the matrix continue if other jobs fails
+      matrix:
+        kernel_variant:
+          # 【改造】首次构建先跳过 Rissu 变体（它的 SUSFS 走 susfs-legacy 分支，多一个变量）
+          # - name: "#️⃣KernelSU-Rissu"
+          #   tag: "KernelSU-Rissu"
+          #   setup_script: "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh"
+          #   setup_arg: "main"
+          #   dir_name: "KernelSU"
+          - name: "☯️KernelSU-Next"
+            tag: "KernelSU-Next"
+            setup_script: "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+            setup_arg: ""
+            dir_name: "KernelSU-Next"
+          - name: "😼SukiSU-Ultra"
+            tag: "SukiSU-Ultra"
+            setup_script: "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh"
+            setup_arg: "nongki"
+            dir_name: "KernelSU"
+    env:
+      # Ccache stuff
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: "2G"
+
+      KERNEL_DEFCONFIG: "lineage_sm8150_defconfig"
+      # Command we run when building the kernel
+      KERNEL_CMDLINE: "ARCH=arm64 SUBARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1 LLVM_IAS=1 LD=ld.lld O=out"
+
+      # Global directory shortcuts
+      DIR_WORKSPACE: "${{ github.workspace }}"
+      DIR_ANYKERNEL3: "AnyKernel3"
+      DIR_KERNEL: "kernel-source"
+      DIR_DEFCONFIGS: "arch/arm64/configs"
+      DIR_BUILD: "out/arch/arm64/boot"
+    steps:
+    - name: "🗃️Ccache"
+      # https://github.com/ccache/ccache
+      uses: hendrikmuhs/ccache-action@v1
+    - name: "💥Install APT package dependencies"
+      # The following list of packages is installed by default: "make, python3, libssl-dev, bc, bison, flex, unzip, xz-utils, cpio, git, aria2, binutils, kmod, ca-certificates, libc6-dev, ccache, pigz, parallel, gcc-14, g++-14"
+      run: |
+        APT_INSTALL="libelf-dev libarchive-tools binutils build-essential mkbootimg device-tree-compiler openjdk-17-jdk-headless"
+        
+        echo "🕑Removing unneeded pre-installed packages..."
+        sudo rm -rf /opt/ghc "/usr/local/share/boost" /usr/share/dotnet "$AGENT_TOOLSDIRECTORY"
+
+        echo "🕑Installing required packages..."
+        sudo apt-get update -y
+        sudo apt-get install $APT_INSTALL -y
+        echo "✅Done..."
+    - name: "👣Git clone and prepare AnyKernel folder"
+      run: |
+        echo "🕑Cloning AnyKernel3..."
+        git clone https://github.com/ebears/AnyKernel3 -b oneplus7 --depth=1 $DIR_ANYKERNEL3
+        rm -rf $DIR_ANYKERNEL3/.git
+        echo "✅Done..."
+    - name: "⚙️Set up Clang"
+      run: |
+        echo "🕑Downloading AntMan to sync Neutron Clang..."
+        mkdir -p "$DIR_WORKSPACE/toolchains/neutron-clang"
+        cd "$DIR_WORKSPACE/toolchains/neutron-clang"
+        aria2c https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman
+        echo "🕑Running AntMan to sync Clang..."
+        chmod +x antman
+        ./antman -S
+        ./antman -I
+        echo "✅Done..."
+    - name: "👯‍♀️Clone kernel source"
+      run: |
+        echo "🕑Cloning kernel source..."
+        git clone --depth=1 --branch lineage-21 https://github.com/LineageOS/android_kernel_oneplus_sm8150 $DIR_KERNEL
+        echo "🕑Initializing submodules..."
+        cd $DIR_WORKSPACE/$DIR_KERNEL && git submodule update --init --recursive
+        echo "✅Done..."
+    - name: "🛠️Apply KernelSU patches"
+      # https://kernelsu.org/guide/how-to-integrate-for-non-gki.html
+      run: |
+        KERNEL_SU_PATCH=000_syscall_hooks.patch
+        FIX_CRED_PATCH=001_FIX_APATCH_OPENELA.patch
+        PATH_UMOUNT_PATCH=002_path_umount.patch
+        FIX_DEBUG_PATCH=003_fix_debug.c.patch
+
+        echo "🕑Applying KernelSU patches for ${{ matrix.kernel_variant.tag }}..."
+        cd $DIR_WORKSPACE/$DIR_KERNEL
+
+        # 【改造】LineageOS 内核树不自带 kernelsu.patch（那是 YAAP 树特有的文件），
+        # 所以改用 ebears 仓库的 000_syscall_hooks.patch
+        # （等价于 https://github.com/SukiSU-Ultra/SukiSU_patch/blob/main/hooks/syscall_hooks.patch）
+        # Reference: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html#manually-modify-the-kernel-source
+        echo "🕑Applying $KERNEL_SU_PATCH for kernel hooks..."
+        aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$KERNEL_SU_PATCH
+        patch -p1 < $KERNEL_SU_PATCH
+
+        # Download and apply FIX_APATCH_OPENELA.patch for APatch support on 4.14.334
+        # Reference: https://github.com/midozalouk/android_kernel_oneplus_sm8150/blob/main/patches%20/FIX_APATCH_OPENELA.patch
+        echo "🕑Applying $FIX_CRED_PATCH to revert using atomic_long_t..."
+        aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$FIX_CRED_PATCH
+        patch -p1 < $FIX_CRED_PATCH
+
+        # Reference: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html#how-to-backport-path-umount
+        echo "🕑Applying $PATH_UMOUNT_PATCH to backport umount functionality..."
+        aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$PATH_UMOUNT_PATCH
+        patch -p1 < $PATH_UMOUNT_PATCH
+
+        # Reference: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html#how-to-backport-path-umount
+        echo "🕑Applying $FIX_DEBUG_PATCH to backport umount functionality..."
+        aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$FIX_DEBUG_PATCH
+        patch -p1 < $FIX_DEBUG_PATCH
+
+        echo "🕑Running setup script for ${{ matrix.kernel_variant.tag }}..."
+        curl -LSs "${{ matrix.kernel_variant.setup_script }}" | bash -s "${{ matrix.kernel_variant.setup_arg }}"
+        echo "✅Done..."
+    - name: "🕵️‍♀️Apply SusFS"
+      # https://gitlab.com/simonpunk/susfs4ksu/-/blob/kernel-4.14/README.md
+      run: |
+        echo "🕑Cloning simonpunk/susfs4ksu repo..."
+        cd $DIR_WORKSPACE/$DIR_KERNEL
+        git clone --depth=1 --branch kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+
+        echo "🕑Copying SusFS files to kernel source..."
+        cp $DIR_WORKSPACE/$DIR_KERNEL/susfs4ksu/kernel_patches/fs/* $DIR_WORKSPACE/$DIR_KERNEL/fs/
+        cp $DIR_WORKSPACE/$DIR_KERNEL/susfs4ksu/kernel_patches/include/linux/* $DIR_WORKSPACE/$DIR_KERNEL/include/linux/
+        if [ "${{ matrix.kernel_variant.tag }}" == "KernelSU-Rissu" ]; then
+          # Skip manual patching; Rissu fork supports SusFS through pulling the compatible git branch
+          echo "🕑Setting up SusFS for KernelSU-Rissu..."
+          echo "🕑Cloning susfs-legacy branch..."
+          curl -LSs "${{ matrix.kernel_variant.setup_script }}" | bash -s susfs-legacy
+        elif [ "${{ matrix.kernel_variant.tag }}" == "KernelSU-Next" ]; then
+          # Lightly modified patch from: https://github.com/WildKernels/kernel_patches/blob/main/next/0001-kernel-implement-susfs-v1.5.8-KernelSU-Next-v1.0.8.patch
+          SUSFS_PATCH_NAME="010_kernel-implement-susfs-v1.5.8-KernelSU-Next.patch"
+          echo "🕑Setting up SusFS for KernelSU-Next..."
+          echo "🕑Applying SusFS patch for KernelSU-Next..."
+          cd $DIR_WORKSPACE/$DIR_KERNEL/KernelSU-Next
+          echo "🕑Downloading KernelSU-Next SusFS patch..."
+          aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$SUSFS_PATCH_NAME
+          echo "🕑Applying patch: $SUSFS_PATCH_NAME ..."
+          patch -p1 < $SUSFS_PATCH_NAME
+          cd $DIR_WORKSPACE/$DIR_KERNEL
+        elif [ "${{ matrix.kernel_variant.tag }}" == "SukiSU-Ultra" ]; then
+          # Skip manual patching; SukiSU supports SusFS through pulling the compatible git branch
+          # https://github.com/SukiSU-Ultra/SukiSU-Ultra/blob/main/docs/guide/how-to-integrate.md#gki--non-gki-kernel-with-susfs-experiment
+          echo "🕑Setting up SusFS for SukiSU-Ultra..."
+          echo "🕑Cloning susfs-main branch..."
+          curl -LSs "${{ matrix.kernel_variant.setup_script }}" | bash -s susfs-main
+        else
+          echo "⛔Unsupported KernelSU variant for SusFS patching: ${{ matrix.kernel_variant.tag }}."
+          exit 1
+        fi
+
+        # Download and apply SusFS patches to the kernel source
+        KERNEL_414_SUSFS_PATCH_155=100_add_susfs_in_kernel-for-kernel-4.14.patch
+        KERNEL_414_SUSFS_PATCH_157=101_susfs_upgrade_to_157.patch
+        KERNEL_414_SUSFS_PATCH_158=102_susfs_upgrade_to_158_4.14.patch
+        KERNEL_414_SUSFS_PATCH_159=103_susfs_upgrade_to_159.patch
+        KERNEL_414_SUSFS_PATCH_1510=104_susfs_upgrade_to_1510_4.14.patch
+        HIDE_STUFF_PATCH=169_hide_stuff.patch
+
+        echo "🕑Downloading SusFS patches for the kernel source..."
+        aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$KERNEL_414_SUSFS_PATCH_155
+        echo "🕑Applying $KERNEL_414_SUSFS_PATCH_155 to the kernel source..."
+        patch -p1 < $KERNEL_414_SUSFS_PATCH_155
+
+        # Apply updates to SusFS
+        # Reference: https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd/tree/mainline/Patches/Patch
+        echo "🕑Downloading $KERNEL_414_SUSFS_PATCH_157..."
+        aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$KERNEL_414_SUSFS_PATCH_157
+        echo "🕑Applying $KERNEL_414_SUSFS_PATCH_157..."
+        patch -p1 < $KERNEL_414_SUSFS_PATCH_157
+
+        echo "🕑Downloading $KERNEL_414_SUSFS_PATCH_158..."
+        aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$KERNEL_414_SUSFS_PATCH_158
+        echo "🕑Applying $KERNEL_414_SUSFS_PATCH_158..."
+        patch -p1 < $KERNEL_414_SUSFS_PATCH_158
+
+        # May be necessary?
+        # Ref: https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd/tree/mainline/.github/workflows/patch-susfs#L62
+        echo "🕑Patching susfs_def.h..."
+        sed -i '/#define CMD_SUSFS_HIDE_SUS_MNTS_FOR_ALL_PROCS 0x55561/a \#define CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE 0x55562' include/linux/susfs_def.h
+
+        echo "🕑Downloading $KERNEL_414_SUSFS_PATCH_159..."
+        aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$KERNEL_414_SUSFS_PATCH_159
+        echo "🕑Applying $KERNEL_414_SUSFS_PATCH_159..."
+        patch -p1 < $KERNEL_414_SUSFS_PATCH_159
+
+        # Needs further patching with KernelSU (Rissu) to work
+        if [ "${{ matrix.kernel_variant.tag }}" != "KernelSU-Rissu" ]; then
+          echo "🕑Downloading $KERNEL_414_SUSFS_PATCH_1510..."
+          aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$KERNEL_414_SUSFS_PATCH_1510
+          echo "🕑Applying $KERNEL_414_SUSFS_PATCH_1510..."
+          patch -p1 < $KERNEL_414_SUSFS_PATCH_1510
+        fi
+
+        # UPDATE: Not sure exactly if this is a benefit, or more of a problem; skipping for now
+        # echo "🕑Downloading $HIDE_STUFF_PATCH..."
+        # aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$HIDE_STUFF_PATCH
+        # echo "🕑Applying $HIDE_STUFF_PATCH..."
+        # patch -p1 < $HIDE_STUFF_PATCH
+        echo "✅Done..."
+    - name: "⚠️Search for patch errors (on failure)"
+      if: failure()
+      run: |
+        echo "🕑One or more patching steps failed; searching for .rej files to upload..."
+        mkdir $DIR_WORKSPACE/rej_files
+        find . -name "*.rej" -exec cp {} $DIR_WORKSPACE/rej_files/ \;
+        echo "✅Done..."
+    - name: "📤Upload any found patch rejects (on failure)"
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: patch-rejects
+        path: rej_files/
+    - name: "🔧Apply Re:Kernel"
+      run: |
+        export JAVA_HOME="/usr/lib/jvm/java-17-openjdk-amd64"
+        cd $DIR_WORKSPACE/$DIR_KERNEL
+
+        echo "🕑Downloading Re:Kernel..."
+        aria2c https://github.com/Sakion-Team/Re-Kernel/releases/download/modifier/Kernel-Modifier-v4.0.jar
+        echo "🕑Patching Re:Kernel support"
+        $JAVA_HOME/bin/java -jar ./Kernel-Modifier-v4.0.jar
+        echo "✅Done..."
+    - name: "🛠️Apply KPM pre-kernel build (if supported)"
+      # Apply KPM fix for patch_linux step later on
+      if: matrix.kernel_variant.tag == 'SukiSU-Ultra'
+      run: |
+        KPM_FIX_PATCH=200_fix_kpm.patch
+        cd $DIR_WORKSPACE/$DIR_KERNEL/KernelSU/kernel/kpm
+
+        echo "🕑Downloading $KPM_FIX_PATCH..."
+        aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$KPM_FIX_PATCH
+        echo "🕑Applying $KPM_FIX_PATCH..."
+        patch -p1 < $KPM_FIX_PATCH
+        echo "✅Done..."
+    - name: "🔧Generate kernel .config"
+      run: |
+        export PATH="$DIR_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
+        cd $DIR_WORKSPACE/$DIR_KERNEL
+
+        echo "🕑Generating kernel config from $KERNEL_DEFCONFIG..."
+        make $KERNEL_CMDLINE CC="ccache clang" $KERNEL_DEFCONFIG
+
+        echo "✅Done..."
+    - name: "✍️Enable required configs"
+      run: |
+        export PATH="$DIR_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
+        cd $DIR_WORKSPACE/$DIR_KERNEL
+
+        echo "🕑Enabling required kernel configurations for KSU..."
+        scripts/config --file out/.config --enable KSU
+        scripts/config --file out/.config --enable KSU_MANUAL_HOOK
+
+        echo "🕑Enabling required kernel configurations for SusFS..."
+        scripts/config --file out/.config --enable KSU_SUSFS
+        scripts/config --file out/.config --enable KSU_SUSFS_HAS_MAGIC_MOUNT
+        scripts/config --file out/.config --enable KSU_SUSFS_SUS_PATH
+        scripts/config --file out/.config --enable KSU_SUSFS_SUS_MOUNT
+        scripts/config --file out/.config --enable KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+        scripts/config --file out/.config --enable KSU_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+        scripts/config --file out/.config --enable KSU_SUSFS_SUS_KSTAT
+        scripts/config --file out/.config --enable KSU_SUSFS_TRY_UMOUNT
+        scripts/config --file out/.config --enable KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+        scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME
+        scripts/config --file out/.config --enable KSU_SUSFS_ENABLE_LOG
+        scripts/config --file out/.config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+        scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+        scripts/config --file out/.config --enable KSU_SUSFS_OPEN_REDIRECT
+        scripts/config --file out/.config --enable KSU_SUSFS_SUS_SU
+
+        echo "🕑Enabling required kernel configurations for Mountify..."
+        # Reference: https://github.com/backslashxx/mountify
+        scripts/config --file out/.config --enable OVERLAY_FS
+        scripts/config --file out/.config --enable TMPFS_XATTR
+        if [ "${{ matrix.kernel_variant.tag }}" == "SukiSU-Ultra" ]; then
+          echo "🕑Enabling required kernel configurations for KPM..."
+          scripts/config --file out/.config --enable KPM
+          scripts/config --file out/.config --enable KALLSYMS
+          scripts/config --file out/.config --enable KALLSYMS_ALL
+          scripts/config --file out/.config --enable DEBUG_KERNEL
+        fi
+
+        echo "✅Finalizing .config..."
+        make $KERNEL_CMDLINE olddefconfig
+
+        echo "✅Done..."
+    - name: "👷‍♀️Build kernel"
+      run: |
+        export PATH="$DIR_WORKSPACE/toolchains/neutron-clang/bin:$PATH"
+        cd $DIR_WORKSPACE/$DIR_KERNEL
+
+        echo "ℹ️Using defconfig: $KERNEL_DEFCONFIG"
+        echo "ℹ️Kernel variant: ${{ matrix.kernel_variant.name }}"
+        echo "ℹ️Ccache stats before build:"
+        ccache -s
+
+        echo "🕑Starting kernel build..."
+        make $KERNEL_CMDLINE CC="ccache clang" -j$(nproc --all)
+        echo "✅Done..."
+    - name: "🫸Copy Kernel image to AnyKernel"
+      run: |
+        echo "🕑Copying kernel image to AnyKernel3 folder..."
+        if cp $DIR_KERNEL/$DIR_BUILD/Image.gz-dtb $DIR_ANYKERNEL3/; then
+          echo "✅Copied Image.gz-dtb to AnyKernel3 directory."
+        elif cp $DIR_KERNEL/$DIR_BUILD/Image.gz $DIR_ANYKERNEL3/; then
+          echo "✅Copied Image.gz to AnyKernel3 directory."
+        elif cp $DIR_KERNEL/$DIR_BUILD/Image $DIR_ANYKERNEL3/; then
+          echo "✅Copied Image to AnyKernel3 directory."
+        else
+          echo "⛔Couldn't find any build image file."
+          echo "🕑Listing build directory contents..."
+          ls -a $DIR_KERNEL/$DIR_BUILD
+          exit 1
+        fi
+    - name: "⚙️Apply KPM post-kernel build (if supported)"
+      if: matrix.kernel_variant.tag == 'SukiSU-Ultra'
+      shell: bash
+      run: |
+        # SukiSU-Ultra KPM support steps from here:
+        # https://github.com/YangQi0408/kernel_xiaomi_sm8250_mod/blob/41d6929480426e0bbdc6697fe692c14d3cfc8014/build.sh#L68
+        cd $DIR_WORKSPACE/$DIR_KERNEL/$DIR_BUILD
+        echo "🕑Downloading patch_linux tool..."
+        aria2c https://github.com/SukiSU-Ultra/SukiSU_patch/raw/refs/heads/main/kpm/patch_linux
+        chmod a+x patch_linux
+        echo "🕑Patching kernel for KPM support..."
+        ./patch_linux Image
+        if [[ ! -f oImage ]]; then
+          echo "⚠️KernelPatch on Image file failed. Skipping..."
+          exit 0
+        else
+          echo "✅Patch applied successfully."
+        fi
+
+        rm Image
+        mv oImage Image
+
+        # Delete image and replace with KPM patched one
+        if rm $DIR_WORKSPACE/$DIR_ANYKERNEL3/Image.gz-dtb; then
+          echo "✅Removed old Image.gz-dtb from AnyKernel3 directory."
+        elif rm $DIR_WORKSPACE/$DIR_ANYKERNEL3/Image.gz; then
+          echo "✅Removed old Image.gz from AnyKernel3 directory."
+        elif rm $DIR_WORKSPACE/$DIR_ANYKERNEL3/Image; then
+          echo "✅Removed old Image from AnyKernel3 directory."
+        else
+          echo "🕑Listing build directory contents..."
+          ls -a $DIR_WORKSPACE/$DIR_KERNEL/$DIR_BUILD
+          echo "⛔Couldn't find any build image file."
+          exit 1
+        fi
+        
+        echo "🕑Copying patched Image to AnyKernel3 directory."
+        cp $DIR_WORKSPACE/$DIR_KERNEL/$DIR_BUILD/Image $DIR_ANYKERNEL3/
+    - name: "📦Create AnyKernel3 ZIP"
+      run: |
+        echo "🕑Packaging kernel into AnyKernel3 ZIP..."
+        if [[ -f "$DIR_KERNEL/$DIR_BUILD/dtbo.img" ]]; then
+          echo "✅Found dtbo.img, copying to AnyKernel3 folder..."
+          cp -fp $DIR_WORKSPACE/$DIR_KERNEL/$DIR_BUILD/dtbo.img $DIR_ANYKERNEL3/
+        else
+          echo "⚠️dtbo.img not found. Skipping..."
+        fi
+
+        if [ -f "$DIR_KERNEL/$DIR_BUILD/dtb" ]; then
+          echo "✅Found dtb folder, copying to AnyKernel3 folder..."
+          cp -fp $DIR_KERNEL/$DIR_BUILD/dtb $DIR_ANYKERNEL3/
+        else
+          echo "⚠️dtb folder not found. Skipping..."
+        fi
+
+        cd $DIR_ANYKERNEL3
+
+        echo "🕑Creating ZIP file: OnePlus-SM8150_LOS-21_${{ matrix.kernel_variant.tag }}.zip"
+        zip -r9 ../OnePlus-SM8150_LOS-21_${{ matrix.kernel_variant.tag }}.zip *
+        echo "✅Done..."
+    - name: "📤Upload defconfig files (on failure)"
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: failed-build-configs-${{ matrix.kernel_variant.tag }}
+        path: |
+          ${{ env.DIR_KERNEL }}/${{ env.DIR_DEFCONFIGS }}/$KERNEL_DEFCONFIG
+          ${{ env.DIR_KERNEL }}/out/.config
+    - name: "🌬️Upload artifact"
+      uses: actions/upload-artifact@v4
+      with:
+        name: OnePlus-SM8150_LOS-21_${{ matrix.kernel_variant.tag }}
+        path: "OnePlus-SM8150_LOS-21_${{ matrix.kernel_variant.tag }}.zip"
+        retention-days: 2
+  release:
+    name: "🍊Aggregate and publish"
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: "💫Download all build artifacts"
+      uses: actions/download-artifact@v5
+      with:
+        path: release-artifacts
+    - name: "🥳Generate release.md"
+      id: generate_body
+      run: |
+        SUSFS_FOUND=0
+        PRINTED_KERNELSU_RISSU=0
+        PRINTED_KERNELSU_NEXT=0
+        PRINTED_SUKISU_ULTRA=0
+
+        echo "📱**Device:** OnePlus SM8150" >> release.md
+        echo "⏱️**Target:** Android 14 (LineageOS 21, 4.14.355-openela)" >> release.md
+
+        while read -r file; do
+          FILE_NAME=$(basename "$file")
+          KERNEL_TAG=$(echo "$FILE_NAME" | sed -E 's/OnePlus-SM8150_LOS-21_([^\.]+).*/\1/')
+          COMMON_NAME=""
+          ICON=""
+          APK_LINK=""
+
+          case "$KERNEL_TAG" in
+            KernelSU-Rissu*)
+              if [[ $PRINTED_KERNELSU_RISSU -eq 0 ]]; then
+                ICON="#️⃣"
+                COMMON_NAME="KernelSU-Rissu"
+                APK_LINK="[APK](https://github.com/rsuntk/KernelSU/releases/latest)"
+                PRINTED_KERNELSU_RISSU=1
+              fi
+              ;;
+            KernelSU-Next*)
+              if [[ $PRINTED_KERNELSU_NEXT -eq 0 ]]; then
+                ICON="☯️"
+                COMMON_NAME="KernelSU-Next"
+                APK_LINK="[APK](https://github.com/KernelSU-Next/KernelSU-Next/releases/latest)"
+                PRINTED_KERNELSU_NEXT=1
+              fi
+              ;;
+            SukiSU-Ultra*)
+              if [[ $PRINTED_SUKISU_ULTRA -eq 0 ]]; then
+                ICON="😼"
+                COMMON_NAME="SukiSU-Ultra"
+                APK_LINK="[APK](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases/latest)"
+                PRINTED_SUKISU_ULTRA=1
+              fi
+              ;;
+            *)
+              ICON="📦"
+              COMMON_NAME="$KERNEL_TAG"
+              APK_LINK=""
+              ;;
+          esac
+
+          if [[ "$KERNEL_TAG" == *SusFS* ]]; then
+            COMMON_NAME="$COMMON_NAME SusFS"
+            SUSFS_FOUND=1
+          fi
+
+          echo "- $ICON $COMMON_NAME: \`$FILE_NAME\` $APK_LINK" >> release.md
+        done < <(find release-artifacts -type f -name "*.zip")
+
+        if [[ $SUSFS_FOUND -eq 1 ]]; then
+          echo "" >> release.md
+          echo "🗃️SusFS Module: [susfs4ksu-module](https://github.com/sidex15/susfs4ksu-module)" >> release.md
+        fi
+
+        echo "body_path=release.md" >> $GITHUB_OUTPUT
+
+    - name: "🎉Create Final GitHub Release"
+      uses: softprops/action-gh-release@v2
+      with:
+        name: "🎈Kernel Builds v${{ github.run_number }}"
+        tag_name: "build-${{ github.run_id }}"
+        prerelease: false
+        body_path: ${{ steps.generate_body.outputs.body_path }}
+        files: release-artifacts/**/*.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
