@@ -131,10 +131,16 @@ jobs:
         aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$PATH_UMOUNT_PATCH
         patch -p1 < $PATH_UMOUNT_PATCH
 
-        # Reference: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html#how-to-backport-path-umount
-        echo "🕑Applying $FIX_DEBUG_PATCH to backport umount functionality..."
-        aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$FIX_DEBUG_PATCH
-        patch -p1 < $FIX_DEBUG_PATCH
+        # 【改造】003_fix_debug.c.patch 是 YAAP 树专用的编译修正：把 kernel/sched/debug.c 中
+        # 引用 entity_eligible() 的那行注释掉。lineage-21 树里根本没有该符号，硬打必然失败
+        # 并中断整个 step（实测 2026-10-15 run#1）。这里改成条件应用 + 失败不致命。
+        if grep -q "entity_eligible" kernel/sched/debug.c 2>/dev/null; then
+          echo "🕑Applying $FIX_DEBUG_PATCH (entity_eligible present)..."
+          aria2c https://raw.githubusercontent.com/ebears/OnePlus-SM8150-Kernel-Builds/refs/heads/main/patches/$FIX_DEBUG_PATCH
+          patch -p1 < $FIX_DEBUG_PATCH || echo "⚠️ $FIX_DEBUG_PATCH 未完全应用，继续"
+        else
+          echo "⏭️Skip $FIX_DEBUG_PATCH (no entity_eligible in lineage-21 tree — not applicable)"
+        fi
 
         echo "🕑Running setup script for ${{ matrix.kernel_variant.tag }}..."
         curl -LSs "${{ matrix.kernel_variant.setup_script }}" | bash -s "${{ matrix.kernel_variant.setup_arg }}"
